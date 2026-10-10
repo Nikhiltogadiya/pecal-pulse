@@ -1,0 +1,424 @@
+"use client";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useAui, useAuiState } from "@assistant-ui/react";
+import { RoomAudioRenderer, RoomContext } from "@livekit/components-react";
+import { Square, Volume2 } from "lucide-react";
+import { ParticlesOrb } from "@/components/voiceorb/particles-orb";
+import { createLiveKitAdapter } from "@/components/voiceorb/create-livekit-adapter";
+import type { OrbState } from "@/components/voiceorb/orb-state";
+import { useSalesStore } from "@/modules/sales/store";
+import { pickSpeakerOutput } from "./audio-output";
+import { LiveKitVoice } from "./voice-livekit";
+
+export function VoicePanel() {
+  const aui = useAui();
+  const running = useAuiState((s) => s.thread.isRunning);
+  const response = useSalesStore((s) => s.voiceResponse);
+  const language = useSalesStore((s) => s.assistantLanguage);
+  const german = language === "de";
+  const savedReply = useSalesStore(
+    (s) =>
+      s.messages
+        .slice()
+        .reverse()
+        .find(
+          (m) =>
+            m.role === "assistant" &&
+            m.status?.type !== "running" &&
+            m.text.trim(),
+        )?.text,
+  );
+  const chatReady = useSalesStore(
+    (s) =>
+      s.apiStatus === "connected" && s.chatStatus?.configured && !s.chatLoading,
+  );
+  const [configured, setConfigured] = useState(false);
+  const [state, setState] = useState<OrbState>("idle");
+  const [speaking, setSpeaking] = useState(false);
+  const [error, setError] = useState("");
+  const [outputs, setOutputs] = useState<MediaDeviceInfo[]>([]);
+  const [outputId, setOutputId] = useState("");
+  // Speaker routing needs setSinkId (Chromium); Safari/Firefox follow the OS default.
+  const outputSupported =
+    typeof HTMLAudioElement !== "undefined" &&
+    "setSinkId" in HTMLAudioElement.prototype;
+  const [voice, setVoice] = useState<LiveKitVoice | null>(null);
+  const [adapter, setAdapter] = useState<ReturnType<
+    typeof createLiveKitAdapter
+  > | null>(null);
+  const mounted = useRef(false);
+  const generation = useRef(0);
+  const spaceHeld = useRef(false);
+  const listening = useRef(false);
+  const seen = useRef(response?.id);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Speaker only; the microphone is always the laptop default. A saved
+  // speaker wins while plugged in, otherwise a lone real output
+  // (e.g. the SoundDrum Bluetooth speaker) is picked automatically.
+  const refreshOutputs = useCallback(async () => {
+    try {
+      const all = await navigator.mediaDevices?.enumerateDevices();
+      if (!all) return "";
+      const outs = all.filter((d) => d.kind === "audiooutput" && d.deviceId);
+      setOutputs(outs);
+      const spk = pickSpeakerOutput(
+        outs.map((d) => ({ deviceId: d.deviceId, label: d.label || "" })),
+        localStorage.getItem("pecal-voice-speaker") || "",
+      );
+      setOutputId(spk);
+      return spk;
+    } catch {
+      return "";
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshOutputs();
+    const update = () => void refreshOutputs();
+    navigator.mediaDevices?.addEventListener("devicechange", update);
+    return () =>
+      navigator.mediaDevices?.removeEventListener("devicechange", update);
+  }, [refreshOutputs]);
+
+  useEffect(() => {
+    if (!voice || !outputId || !outputSupported) return;
+    void voice
+      .setOutput(outputId)
+      .then((ok) => {
+        if (!ok && mounted.current)
+          setError(
+            "This browser kept the system speaker. Use Chrome or Edge to route Pulse elsewhere.",
+          );
+      })
+      .catch(() => {
+        if (mounted.current) setError("Could not switch speaker output.");
+      });
+  }, [voice, outputId, outputSupported]);
+
+  useEffect(() => {
+    mounted.current = true;
+    const client = new LiveKitVoice(
+      {
+        onSpeaking: (value) => {
+          if (mounted.current) setSpeaking(value);
+        },
+        onError: (message) => {
+          if (mounted.current) {
+            setError(message);
+            setState("error");
+          }
+        },
+      },
+      language,
+    );
+    const meter = createLiveKitAdapter();
+    setVoice(client);
+    setAdapter(meter);
+    const abort = new AbortController();
+    fetch("/api/sales/voice/status", { signal: abort.signal })
+      .then((r) => r.json())
+      .then((s) => {
+        setConfigured(s.configured);
+        if (!s.configured)
+          setError("Configure LiveKit in the root .env to enable voice.");
+      })
+      .catch(() => {
+        if (!abort.signal.aborted) setError("Voice backend unavailable.");
+      });
+    return () => {
+      mounted.current = false;
+      generation.current++;
+      abort.abort();
+      if (timer.current) clearTimeout(timer.current);
+      meter.dispose();
+      client.close();
+      useSalesStore.getState().set({ voiceBusy: false });
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!voice || !response || seen.current === response.id) return;
+    seen.current = response.id;
+    // LiveKit already speaks one immediate acknowledgement. Tool narration stays text-only.
+    if (response.kind === "progress") return;
+    void voice.speak(response.text).catch((e) => {
+      if (mounted.current) setError(e.message || "Could not speak this reply.");
+    });
+  }, [response, voice]);
+
+  const cancel = () => {
+    generation.current++;
+    spaceHeld.current = false;
+    listening.current = false;
+    if (timer.current) clearTimeout(timer.current);
+    adapter?.setTrack();
+    void voice?.cancel();
+    if (running) aui.thread.cancelRun();
+    setSpeaking(false);
+    setState("idle");
+    useSalesStore.getState().set({ voiceBusy: false });
+  };
+  const submit = async () => {
+    spaceHeld.current = false;
+    if (!voice || !listening.current) return;
+    listening.current = false;
+    if (timer.current) clearTimeout(timer.current);
+    adapter?.setTrack();
+    setState("connecting");
+    const epoch = generation.current;
+    try {
+      const text = await voice.finish();
+      if (!mounted.current || epoch !== generation.current) return;
+      setState("idle");
+      useSalesStore.getState().set({ voiceBusy: false });
+      if (!text) return;
+      useSalesStore.getState().set({ voiceInputPending: true });
+      // Spoken turns use the existing agent/tool stream immediately. Leave typed drafts intact.
+      await aui.thread.append({
+        role: "user",
+        content: [{ type: "text", text }],
+      });
+    } catch (e) {
+      if (mounted.current && epoch === generation.current) {
+        setError(
+          e instanceof Error ? e.message : "Could not transcribe speech.",
+        );
+        setState("error");
+        useSalesStore.getState().set({ voiceBusy: false });
+      }
+    }
+  };
+  const start = async () => {
+    if (!voice) return;
+    // A new spoken turn interrupts both audio and the running LangGraph turn.
+    if (running) aui.thread.cancelRun();
+    setError("");
+    setState("connecting");
+    useSalesStore.getState().set({ voiceBusy: true });
+    setSpeaking(false);
+    const epoch = ++generation.current;
+    try {
+      if (
+        !(await voice.start()) ||
+        !mounted.current ||
+        epoch !== generation.current
+      )
+        return;
+      const spk = await refreshOutputs();
+      if (spk && outputSupported) await voice.setOutput(spk).catch(() => {});
+      listening.current = true;
+      setState("listening");
+      adapter?.setTrack({ publication: voice.microphone() });
+      timer.current = setTimeout(() => void submit(), 44000);
+    } catch (e) {
+      if (mounted.current && epoch === generation.current) {
+        void voice.cancel();
+        setError(e instanceof Error ? e.message : "Could not start voice.");
+        setState("error");
+        useSalesStore.getState().set({ voiceBusy: false });
+      }
+    }
+  };
+  const tap = () => {
+    if (listening.current) void submit();
+    else if (running || speaking || state === "connecting") cancel();
+    else void start();
+  };
+  useEffect(() => {
+    const editable = (target: EventTarget | null) =>
+      target instanceof HTMLElement &&
+      Boolean(
+        target.closest(
+          "input, textarea, select, [contenteditable='true'], [role='textbox'], a, button:not(.voice-orb-button), [role='button']:not(.voice-orb-button)",
+        ),
+      );
+    const down = (event: KeyboardEvent) => {
+      if (
+        event.code !== "Space" ||
+        editable(event.target) ||
+        event.altKey ||
+        event.ctrlKey ||
+        event.metaKey ||
+        !configured ||
+        !chatReady
+      )
+        return;
+      event.preventDefault();
+      if (
+        event.repeat ||
+        spaceHeld.current ||
+        listening.current ||
+        state === "connecting"
+      )
+        return;
+      spaceHeld.current = true;
+      void start();
+    };
+    const up = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || !spaceHeld.current) return;
+      event.preventDefault();
+      spaceHeld.current = false;
+      if (listening.current) void submit();
+      else cancel();
+    };
+    const blur = () => {
+      if (spaceHeld.current) cancel();
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", blur);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", blur);
+    };
+  });
+  const displayed =
+    state === "listening"
+      ? "listening"
+      : speaking
+        ? "speaking"
+        : running
+          ? "thinking"
+          : state;
+  const active =
+    listening.current || speaking || running || state === "connecting";
+  return (
+    <div className="voice-panel">
+      {voice && (
+        <RoomContext.Provider value={voice.room}>
+          <RoomAudioRenderer />
+        </RoomContext.Provider>
+      )}
+      <button
+        className="voice-orb-button"
+        aria-label={
+          listening.current
+            ? "Send voice request"
+            : active
+              ? "Stop response"
+              : "Start voice request"
+        }
+        aria-keyshortcuts="Space"
+        title={
+          german
+            ? "Leertaste halten zum Sprechen; loslassen zum Senden. Oder tippen."
+            : "Hold Space to speak; release to send. Or tap."
+        }
+        aria-pressed={state === "listening"}
+        disabled={!configured || !chatReady}
+        onClick={tap}
+      >
+        <ParticlesOrb
+          state={!configured || !chatReady ? "disabled" : displayed}
+          levelRef={state === "listening" ? adapter?.levelRef : undefined}
+          size={156}
+          colorFrom="#b96532"
+          colorTo="#f5b079"
+          label={displayed}
+        />
+        <span className="voice-orb-icon">{active && <Square size={17} />}</span>
+      </button>
+      <div className="voice-controls">
+        <label className="voice-language">
+          <span>{german ? "Sprache" : "Language"}</span>
+          <select
+            aria-label="Assistant language"
+            value={language}
+            disabled={active}
+            onChange={(event) => {
+              const next = event.target.value === "de" ? "de" : "en";
+              localStorage.setItem("pecal-assistant-language", next);
+              useSalesStore.getState().set({
+                assistantLanguage: next,
+                voiceInputPending: false,
+                voiceResponse: null,
+              });
+            }}
+          >
+            <option value="en">EN · English</option>
+            <option value="de">DE · Deutsch</option>
+          </select>
+        </label>
+        <span className="voice-status" role="status">
+          {state === "listening"
+            ? spaceHeld.current
+              ? german
+                ? "Hört zu · Leertaste zum Senden loslassen"
+                : "Listening · release Space to send"
+              : german
+                ? "Hört zu · zum Senden tippen"
+                : "Listening · tap to send"
+            : speaking
+              ? german
+                ? "Spricht · zum Stoppen tippen"
+                : "Speaking · tap to stop"
+              : running
+                ? german
+                  ? "Wird bearbeitet…"
+                  : "Working…"
+                : state === "connecting"
+                  ? german
+                    ? "Verbindung wird hergestellt…"
+                    : "Connecting…"
+                  : german
+                    ? "Leertaste zum Sprechen halten · oder tippen"
+                    : "Hold Space to speak · or tap"}
+        </span>
+        <button
+          className="icon-button"
+          aria-label={savedReply ? "Hear latest reply" : "Test speaker"}
+          title={savedReply ? "Hear latest reply" : "Test speaker"}
+          disabled={
+            !configured ||
+            state === "listening" ||
+            state === "connecting" ||
+            running
+          }
+          onClick={() => {
+            setError("");
+            void voice
+              ?.speak(
+                savedReply ||
+                  (german
+                    ? "Pulse ist bereit. Du kannst jetzt sprechen."
+                    : "Pulse is ready. You can speak now."),
+                true,
+              )
+              .catch((e) => setError(e.message || "Could not play speech."));
+          }}
+        >
+          <Volume2 size={17} />
+        </button>
+        {outputSupported && outputs.length > 1 && (
+          <select
+            className="voice-input-select"
+            aria-label="Speaker output"
+            title="Where Pulse's speech plays"
+            value={outputId}
+            disabled={active}
+            onChange={(e) => {
+              const id = e.target.value;
+              setOutputId(id);
+              if (id) localStorage.setItem("pecal-voice-speaker", id);
+              else localStorage.removeItem("pecal-voice-speaker");
+            }}
+          >
+            <option value="">Speakers · System default</option>
+            {outputs.map((d) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label || "Speaker"}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+      {error && (
+        <p className="voice-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,170 @@
+"""data layer: normalized snapshot loading (plan §4A, §5 seam).
+
+Seams (names per plan §5):
+    load_snapshot(snapshot_id) -> validated section rows + manifest
+    get_customer_profile -> profile/history/portfolio/requirements (see
+        get_customer_detail, which also returns instruments and events)
+
+Snapshots are immutable JSON documents. The loader validates every row
+against the frozen v2 contracts and rejects mismatched snapshot_ids.
+The synthetic fixture ships in data/mock/; real extracts live in
+data/runtime/snapshots/<snapshot_id>.json (gitignored, never committed).
+"""
+
+import json
+import re
+import sqlite3
+from contextlib import closing
+from threading import RLock
+from functools import lru_cache
+from pathlib import Path
+
+from ...contracts import sales_v2 as v2
+
+ROOT = Path(__file__).resolve().parents[4]
+MOCK_SNAPSHOT_FILE = ROOT / "data/mock/v2_snapshot_synthetic.json"
+RUNTIME_SNAPSHOT_DIR = ROOT / "data/runtime/snapshots"
+
+_SECTION_MODELS = {
+    "profiles": v2.CustomerProfile,
+    "history": v2.MonthlyHistoryRow,
+    "portfolio": v2.PortfolioRow,
+    "instruments": v2.InstrumentRecord,
+    "events": v2.InstrumentEvent,
+    "requirements": v2.Requirement,
+}
+
+
+def _manifest_only(path: Path) -> dict:
+    # Our snapshot writer places the small manifest first; don't parse hundreds
+    # of MB merely to enumerate or select a snapshot on every request.
+    with path.open() as source:
+        prefix = source.read(65536)
+    match = re.search(r'"manifest"\s*:', prefix)
+    if match is None:
+        raise ValueError("Snapshot manifest missing from header")
+    return json.JSONDecoder().raw_decode(prefix[match.end():].lstrip())[0]
+
+
+def available_snapshots() -> list[str]:
+    ids = []
+    if MOCK_SNAPSHOT_FILE.exists():
+        manifest = _manifest_only(MOCK_SNAPSHOT_FILE)
+        ids.append(manifest["snapshot_id"])
+    if RUNTIME_SNAPSHOT_DIR.is_dir():
+        for file in sorted(RUNTIME_SNAPSHOT_DIR.glob("*.json")):
+            try:
+                manifest = _manifest_only(file)
+                if manifest["snapshot_id"] not in ids:
+                    ids.append(manifest["snapshot_id"])
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+    return ids
+
+
+def _snapshot_path(snapshot_id: str) -> Path:
+    raw = _manifest_only(MOCK_SNAPSHOT_FILE)
+    if raw["snapshot_id"] == snapshot_id:
+        return MOCK_SNAPSHOT_FILE
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", snapshot_id):
+        raise ValueError("Invalid snapshot ID")
+    candidate = RUNTIME_SNAPSHOT_DIR / f"{snapshot_id}.json"
+    if candidate.is_file():
+        raw = _manifest_only(candidate)
+        if raw.get("snapshot_id") == snapshot_id:
+            return candidate
+    raise ValueError(f"Unknown snapshot: {snapshot_id}")
+
+
+def runtime_source_path(snapshot_id: str) -> Path:
+    source = _snapshot_path(snapshot_id)
+    compact = source.with_name(source.stem + ".compact.json")
+    if compact.is_file():
+        return compact
+    if source.stat().st_size > 100 * 1024 * 1024:
+        raise ValueError("Large source needs a compact runtime snapshot. Run python -m analysis.build_runtime_snapshot --snapshot-id " + snapshot_id)
+    return source
+
+
+@lru_cache(maxsize=2)
+def _load_snapshot(snapshot_id: str) -> dict:
+    """Load and contract-validate one immutable snapshot document."""
+    source = runtime_source_path(snapshot_id)
+    raw = json.loads(source.read_text())
+    manifest = v2.SnapshotManifest.model_validate(raw["manifest"])
+    if manifest.snapshot_id != snapshot_id:
+        raise ValueError("snapshot_id mismatch inside snapshot document")
+    validated = {"manifest": manifest}
+    for section, model in _SECTION_MODELS.items():
+        validated[section] = [
+            model.model_validate(row) for row in raw.get(section, [])
+        ]
+    validated["month_grid"] = list(raw.get("month_grid", []))
+    validated["industry_labels"] = list(raw.get("industry_labels", []))
+    validated["equipment_group_labels"] = list(raw.get("equipment_group_labels", []))
+    for key in ("runtime_compact", "ranking_instrument_counts", "customer_group_ids", "requirement_summary"):
+        if key in raw:
+            validated[key] = raw[key]
+    return validated
+
+
+_snapshot_lock = RLock()
+def load_snapshot(snapshot_id: str) -> dict:
+    # Serialize cold reads so bootstrap/chat/map cannot parse the large source twice.
+    with _snapshot_lock:
+        return _load_snapshot(snapshot_id)
+load_snapshot.cache_clear = _load_snapshot.cache_clear
+load_snapshot.cache_info = _load_snapshot.cache_info
+
+
+def get_manifest(snapshot_id: str) -> v2.SnapshotManifest:
+    return load_snapshot(snapshot_id)["manifest"]
+
+
+def list_customers(snapshot_id: str) -> list[v2.CustomerProfile]:
+    return load_snapshot(snapshot_id)["profiles"]
+
+
+def get_customer_detail(snapshot_id: str, customer_id: str, full_evidence: bool = False) -> dict:
+    """Profile + history + portfolio + instruments + events + requirements."""
+    snapshot = load_snapshot(snapshot_id)
+    if "_customer_index" not in snapshot:
+        index = {p.customer_id: {"profile": p, **{name: [] for name in ("history", "portfolio", "instruments", "events", "requirements")}} for p in snapshot["profiles"]}
+        keys = {"history": "customer_id", "portfolio": "customer_id", "instruments": "current_customer_id", "events": "historical_customer_id", "requirements": "customer_id"}
+        for section, key in keys.items():
+            for row in snapshot[section]:
+                customer = getattr(row, key)
+                if customer in index:
+                    index[customer][section].append(row)
+        snapshot["_customer_index"] = index
+    detail = snapshot["_customer_index"].get(customer_id)
+    if detail is None:
+        raise ValueError(f"Unknown customer: {customer_id}")
+    if full_evidence and snapshot.get("runtime_compact"):
+        path = _snapshot_path(snapshot_id).with_name(snapshot_id + ".requirements.sqlite3")
+        with closing(sqlite3.connect(path)) as db:
+            # Bounded page: retain actionable evidence before other historical rows.
+            active = detail["requirements"][:500]
+            seen = {r.id for r in active}
+            extra = [v2.Requirement.model_validate_json(row[0]) for row in db.execute(
+                "SELECT payload FROM requirements WHERE customer_id=? LIMIT 500", (customer_id,))]
+        requirements = (active + [r for r in extra if r.id not in seen])[:500]
+        return {**detail, "requirements": requirements}
+    return detail
+
+
+
+def recency_months(snapshot_id: str, customer_id: str) -> int | None:
+    """Months from reference date back to the latest nonzero history month."""
+    snapshot = load_snapshot(snapshot_id)
+    reference = snapshot["manifest"].reference_date[:7]
+    active = sorted(
+        h.month for h in get_customer_detail(snapshot_id, customer_id)["history"]
+        if h.calibration_events > 0
+    )
+    if not active:
+        return None
+    latest = active[-1]
+    return (int(reference[:4]) - int(latest[:4])) * 12 + (
+        int(reference[5:7]) - int(latest[5:7])
+    )
